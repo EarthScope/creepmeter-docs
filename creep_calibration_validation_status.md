@@ -94,6 +94,22 @@ These are actual dextral/orthogonal displacement sensors (same physical quantity
 | xmd/xmdb | dsat | 1617 | dextral2 | secondary/backup bottle, no calibration |
 | xva/xvab | dsat | 2902 | dextral2 | secondary/backup bottle, no calibration |
 
+**Compared against their site's primary calibrated channel** (raw values pulled directly from `creep.observations`, joined on nearest timestamp within 5 minutes). Correlated both raw levels and sample-to-sample changes (diff), since level correlation alone can just reflect a shared slow drift rather than real co-movement:
+
+| secondary | primary | level corr | diff corr (real-time co-movement) | std ratio | read |
+|---|---|---|---|---|---|
+| `sjnl` | `sjnh` | 0.60 | **0.89** | 1.22 | **Clearly alive, tracking the same real signal** — near-identical fine-grained movement to the primary. Best candidate of the 9 for actual calibration if ever wanted (e.g. by regressing against the primary's calibrated value). |
+| `sf2o` | `sf2d` | 0.73 | **0.39** | 0.68 | **Real correlation**, weaker than `sjnl` since orthogonal vs. dextral are different fault-motion components, not redundant sensors -- genuinely functioning, not dead. |
+| `cfwb` | `cfw1` | 0.09 | 0.30 | 4.83 | Weak but nonzero co-movement; ~5x noisier than primary -- marginal. |
+| `cfwd` | `cfw1` | -0.28 | -0.16 | 0.95 | Inversely correlated -- possible reversed sign/polarity, not confirmed. |
+| `c462` | `c461` | 0.56 | -0.02 | 1.01 | Level correlation is just shared slow drift -- no real fine-grained co-movement. |
+| `x46b` | `x461` | 0.53 | -0.02 | 0.83 | Same pattern as `c462` -- drift only, not real tracking. |
+| `sf2b` | `sf2d` | 0.58 | 0.06 | 0.07 | Essentially flat (range 0-5) -- matches its manifest flag "STUCK near-rail, likely dead." |
+| `xmdb` | `xmd1` | -0.02 | 0.06 | 1.25 | No relationship -- noise. |
+| `xvab` | `xva1` | 0.11 | 0.09 | 0.34 | Weak/no relationship -- likely dead or noise. |
+
+Bottom line: of the 9, only `sjnl` and `sf2o` show genuine physical co-movement with their primary channel. The rest either track a shared slow trend with no real fine-scale correlation (`c462`, `x46b`), or show essentially no relationship at all (`xmdb`, `xvab`, `sf2b` -- consistent with the "likely dead" flags already in the manifest).
+
 ### Pressure / CO2 / dewpoint (5 channels)
 
 | station/sensor | source | sample raw | component | units (believed) |
