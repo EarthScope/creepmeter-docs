@@ -1,173 +1,132 @@
-# Creepmeter Iceberg archive — how the tables fit together
+# Creepmeter Iceberg archive — reference
 
-## Purpose
+Six tables, AWS Glue catalog `creep_dev_iceberg`, `dev` profile, account `599637926940`, region `us-east-2`, warehouse `s3://creep-dev-iceberg-599637926940-us-east-2/creep`. Schemas are defined in `etl/catalog.py` (pyiceberg has no SQL DDL executor) and mirrored for humans in `docs/creep_<table>.iceberg.sql` — the two must be kept in sync by hand.
 
-Load **raw** (not processed) creepmeter bottle data into Iceberg on AWS (`dev` profile, Glue database `creep_dev_iceberg`, S3 bucket `creep-dev-iceberg-599637926940-us-east-2`, `us-east-2`), so a from-raw pipeline can eventually be run and compared against the existing local processed bottles as a validation step. Processed bottles are deliberately not loaded yet.
+For the full design history, bugs found, and rationale behind every decision below, see **`docs/creep_iceberg_details.md`**. This doc is deliberately just "what's here and how to query it" — update it whenever a table/column is added, renamed, or dropped; leave the narrative/history to `creep_iceberg_details.md`.
 
-Four tables, all live in AWS.
+## Identity model
 
-| table | status | what it holds |
+Every table keys on **`(site, channel, source)`**:
+- `site` — the station (directory), e.g. `xta`, `cpp`, `sjb`.
+- `channel` — the raw sensor/bottle identity, e.g. `xta1`, `cpp1`. NOT the directory name — a directory can house more than one channel over time (see `channel_map`).
+- `source` — `dsat | HOBO`, disambiguates the rare case where `(site, channel)` alone isn't unique (two different physical loggers sharing a 4-char code).
+
+## Tables
+
+### `creep.observations` — 173,193,321 rows
+Raw bottle readings plus each derived pipeline stage, one row per sample.
+
+| column | type | notes |
 |---|---|---|
-| `creep.observations` | created in AWS, empty pending a from-scratch load | raw sensor readings + placeholders for the calibrated/cleaned stages |
-| `creep.calibrations` | live, 156 rows | the scale/offset/angle recipe used to turn raw counts/volts into mm |
-| `creep.edits` | live, 1481 rows | offset and delete-interval instructions consumed by `cleanstrain`, stored under the resolved raw-sensor identity (see below) |
-| `creep.channel_map` | live, 53 rows | audit trail of how each `creep.edits` directory stem was resolved to a raw sensor identity — no longer needed at query time, see below |
+| site, channel, source | string | identity, see above |
+| timestamp | timestamp | sample time |
+| raw_value | float | sensor counts or logger volts |
+| raw_units | string | |
+| calibrated_value | double, nullable | raw_value with calibration + fixit_script edits applied |
+| calibrated_units | string, nullable | |
+| edited_value | double, nullable | calibrated_value with cumulative creep.edits offsets applied (all edit_source values) — **not yet populated**, needs offset-detection runs |
+| qc_status | string | `ok \| excluded \| unprocessed` |
+| merged_value | double, nullable | edited_value × rescale — **not yet populated**, needs edited_value first |
 
-DDL for all four lives in `docs/creep_{observations,calibrations,edits,channel_map}.iceberg.sql`.
+Partitioned by `(years(timestamp), site)`. Sparse: rows equal to the source's own missing-data sentinel are dropped at load, not stored.
 
-## The identity model: `site` / `channel` / `source`
+### `creep.calibrations` — 184 rows
+The scale/offset/angle recipe used to compute `calibrated_value` from `raw_value`. One row per real interval — a channel with N historical recalibrations has N rows.
 
-Every raw creepmeter signal is identified by three things:
-- **`site`** — the 3-4 char physical location code (`cpp`, `cfw`, `c46`, ...)
-- **`channel`** — the raw sensor/bottle filename (`cpp1`, `cfw2`, `c461`, ...) — **not** the containing directory name
-- **`source`** — which logger system produced it, `dsat` or `HOBO`
+| column | type | notes |
+|---|---|---|
+| calibration_id | string | natural key: `site:channel:source:calibration_method:effective_start` |
+| site, channel, source | string | |
+| effective_start, effective_end | timestamp | effective_end null = open-ended |
+| calibration_method | string, nullable | `CREEP \| CREEP-USGS \| CREEP-ID \| Rupture`, null = uncalibrated |
+| scale_value, scale_units | double/string, nullable | null when calibration_method is null |
+| offset_mm, angle_deg, angle_applied | | Rupture-specific |
+| source_file, source_ref, note | string | provenance |
 
-`(site, channel, source)` is the natural join key across `observations`, `calibrations`, **and `edits`** — all three store this identity directly, no indirection needed.
+### `creep.edits` — 1,493 rows
+Every `.off` (offset event) / `.edit` (delete interval) entry, plus hardcoded "fixit" script patches and (eventually) algorithmically-detected offsets.
 
-## `creep.edits`: resolved at load time, `creep.channel_map` is now audit trail only
+| column | type | notes |
+|---|---|---|
+| dir_stem | string | original directory stem, e.g. `cfw` — provenance only |
+| site, channel, source | string | **resolved** identity, matches observations/calibrations directly (no channel_map join needed) |
+| pipeline | string | `CREEP \| Rupture` — which directory tree, not a calibration concept |
+| kind | string | `offset \| delete` |
+| flag | string | `N`=instrumental, `T`=eq/tide, `M`=manual |
+| applied | boolean | false if skipped (leading `S`) |
+| event_start, event_end | timestamp | event_end only for `kind=delete` |
+| note, category, source_file | string | |
+| edit_source | string | `off_edit_file \| fixit_script \| cleanstrain_offset` |
+| apply_stage | string | `calibrated_mm \| raw_counts` — whether magnitude applies before or after calibration |
+| magnitude | double, nullable | set for `fixit_script`/`cleanstrain_offset`; null for `off_edit_file` (real offset size only known via offset estimation) |
+| detection_run_id | string, nullable | `creep.offset_runs.run_id` that proposed this edit; only set for `edit_source=cleanstrain_offset` |
 
-`creep.edits.dir_stem` is **not** a raw sensor name — it's the stem of whatever directory the `.off`/`.edit` file lived in (e.g. `mrc`, `c46`, `cfwLR`). Checked against the full manifest: only 5 of 53 distinct values are already a raw sensor name; the rest are directory stems, and — a real bug found while making this change — the *site* the original CSV stored for each row was also wrong for 15 of 53 directories, since it was naively copied from `dir_stem` too (e.g. `dir_stem=xsjd` was stored as `site=xsj`, but the true site is `sjb`).
+### `creep.channel_map` — 56 rows
+Audit trail of how each `dir_stem` resolves to `(site, channel, source)` — no longer needed at query time (edits already carries resolved identity) but documents *how* ambiguous cases were decided.
 
-Originally this meant every `edits`-to-`observations`/`calibrations` query had to join through `creep.channel_map` to translate `dir_stem` into real identity. That indirection has been eliminated: `etl/load_edits.py` now resolves `site`/`channel`/`source` via `creep_channel_map.csv` (keyed on `dir_stem`) **at load time** and stores the resolved values directly in `creep.edits`. `dir_stem` is kept as an extra column, needed only for provenance and to regenerate the original `.off`/`.edit` filename (see round-trip queries in the DDL file) — it is no longer part of the join key.
+| column | type | notes |
+|---|---|---|
+| dir_stem | string | matches creep.edits.dir_stem |
+| site, channel, source | string | resolved identity |
+| effective_start, effective_end | timestamp, nullable | lets one dir_stem resolve to different channels over time |
+| resolution_method | string | how this row was decided |
+| note | string | |
 
-`creep.channel_map` itself is unchanged in content and still built the same way (authority order: `.id` file's `Strain=`/`chan=` line, then physically-verified manifest row, then only-candidate, then flagged conflict/lineage cases — see gotchas below) — it just no longer needs to be queried at read time. It remains valuable as a record of *how* each ambiguous case was resolved (`resolution_method` column, e.g. `conflict_id_vs_physical`).
+### `creep.offset_runs` — 0 rows (schema only, not yet populated)
+Audit trail for offset-detection ("cleanstrain-equivalent") runs that will produce `edited_value`.
 
-Join pattern is now direct:
+| column | type | notes |
+|---|---|---|
+| run_id | string | natural key: `site:channel:source:mode:window_end` |
+| site, channel, source | string | |
+| mode | string | `fresh` (unchained, ≤720-day window) \| `chained` (`-R` off a prior fresh run) |
+| window_start, window_end, run_at | timestamp | |
+| prior_run_id | string, nullable | links a chained run to the fresh run it referenced |
+| white_noise, power_law_index, power_law_amplitude | double, nullable | noise-model parameters |
+| results_uri | string, nullable | S3 path to raw run output |
+| status | string | `ok \| failed` |
+| note | string, nullable | |
+
+### `creep.rescale_factors` — 19 rows
+LVDT-aging correction (interval-scoped scale factor) needed for `merged_value`. A separate table from `calibrations` on purpose — same shape, different pipeline stage (corrects `edited_value`, not raw counts/volts). Only 9 channels have real entries.
+
+| column | type | notes |
+|---|---|---|
+| rescale_id | string | natural key: `site:channel:source:effective_start` |
+| site, channel, source | string | |
+| effective_start, effective_end | timestamp | effective_end null = open-ended |
+| old_scale_factor, new_scale_factor | double | lvdt mm/V, verbatim from source file |
+| ratio | double | new/old; 1.0 = no-op interval |
+| source_file, note | string | |
+
+## Basic usage
+
+Load a table:
+```python
+from catalog import get_catalog
+catalog = get_catalog()
+table = catalog.load_table("creep.observations")
+df = table.scan(row_filter="site == 'xta' AND channel == 'xta1'").to_arrow().to_pandas()
+```
+
+Join `observations` to its calibration (interval lookup, not a flat join — pick the row whose `[effective_start, effective_end)` covers the sample's `timestamp`):
 ```sql
-SELECT o.*
-FROM creep.observations o
-JOIN creep.edits e ON e.site = o.site AND e.channel = o.channel AND e.source = o.source
-WHERE e.kind = 'delete' AND e.applied
-  AND o.timestamp BETWEEN e.event_start AND e.event_end;
+SELECT o.*, c.scale_value, c.calibration_method
+FROM creep.observations o JOIN creep.calibrations c
+  ON o.site = c.site AND o.channel = c.channel AND o.source = c.source
+ AND o.timestamp >= c.effective_start
+ AND (c.effective_end IS NULL OR o.timestamp < c.effective_end)
 ```
 
-## `creep.calibrations`: one row per calibration *recipe*, not per channel
-
-A channel can have more than one calibration recipe (different downstream products from the same raw sensor), and a recipe can change over time. `calibration_id`'s natural key is **`site:channel:source:calibration_method:effective_start`** — all five parts are needed:
-- `cpp3` has two rows (`calibration_method=CREEP` scale `0.000292`, `calibration_method=Rupture` scale `0.0002513`) with identical site/channel/source/effective_start — only `calibration_method` differs.
-- `xmr2` has three rows (three back-to-back 2019 recalibration intervals) with identical site/channel/source/calibration_method — only `effective_start` differs.
-
-`calibration_method` (`CREEP | CREEP-USGS | CREEP-ID | Rupture`, or `NULL` for uncalibrated channels like voltage/rain bottles — `source` covers their raw provenance instead) means "which calibration recipe was used." This used to share the column name `pipeline` with `creep.edits.pipeline` (`CREEP | Rupture` only, meaning "which top-level directory tree" the edit file lived under) despite being a different, finer-grained concept — renamed to `calibration_method` to remove that ambiguity. A `CREEP-USGS`-type channel's edits are still tagged `pipeline=CREEP` in `edits` because its `.off` file physically lives under `CREEP/`, even though its calibration method is `CREEP-USGS` — the two columns still aren't comparable, they just no longer share a name that implies they should be.
-
-Applying a calibration row to get `corrected_value` is meant to be one uniform formula regardless of calibration method:
+Flag samples inside an applied delete window:
+```sql
+SELECT o.* FROM creep.observations o LEFT JOIN creep.edits e
+  ON e.site = o.site AND e.channel = o.channel AND e.source = o.source
+ AND e.kind = 'delete' AND e.applied
+ AND o.timestamp BETWEEN e.event_start AND e.event_end
+WHERE e.channel IS NULL;   -- clean samples only
 ```
-corrected_value = raw_value * scale_value + COALESCE(offset_mm, 0)
-```
-`angle_deg`/`angle_applied` are provenance-only — they document how `scale_value` was derived, not inputs to this formula.
 
-**`CREEP`-pipeline channels now carry their full multi-interval `.chan` history**, not just the current scale. Found via full-history validation against each channel's `<sensor>.jl` file (the real pre-cleanstrain calibrated bottle, still on disk in each `*_dir/`): the manifest's own `scale` column is only ever the single *current* value, and using it alone silently applied today's scale to a channel's entire history. Confirmed real for 39 of 44 CREEP-pipeline channels — e.g. `xfro` was `2.334 mm/V` until a 2025-02-26 "switch to licor" dropped it to `1.000`; the old single-scale code gave 0% match against `xfro.jl` before that date. Fixed by reading `docs/creepmeter_channels.csv` (the already-compiled full `.chan` interval history) for this pipeline instead of the manifest, mirroring how `CREEP-USGS` already expands multiple intervals from `Creep_calib_140224.dat`. `Rupture` is deliberately unchanged (still single-value, post-angle-bug-fix-only, per the decision below). Reloaded: `creep.calibrations` grew from 156 to 185 rows. Full-history validation against `<sensor>.jl` across all 50 channels that have one jumped from 15/50 to 30/50 matching within 0.01mm, zero regressions.
+Backfilling: `etl/backfill_calibrated.py <site> <channel> <source>` computes `calibrated_value`/`calibrated_units` for one channel, full history. No equivalent script yet for `edited_value`/`merged_value` — those need the offset-detection run orchestration (`creep.offset_runs`) built first.
 
-**`scale_units` is source-accurate, not uniform** — confirmed by reading each pipeline's actual source file, not assumed:
-- `CREEP`/`Rupture` (`.chan`-sourced): `mm/V`, used as-is, no inversion (already multiply-convention, and genuinely volt-based — most of these bottles are FLOAT4).
-- `CREEP-ID` (`c46.id`'s `Scale` line, e.g. `-0.012046 mm/cnts`): `mm/cnts`, used as-is.
-- `CREEP-USGS` (`Creep_calib_140224.dat`): natively **cnts/mm** (opposite direction) — inverted at load time to `mm/cnts`. Verified this is exactly what the real production script does: `Apply_Cal_1+` computes `scale = 1.0/$4` from the file's raw cnts/mm column, and separately substitutes a channel's actual raw-data start/end for any `0` ("open") sentinel in the calibration file — both behaviors are replicated exactly in `etl/load_calibrations.py`, not just inferred.
-- For `CREEP-USGS` rows where the calibration label differs from the raw sensor name (e.g. `xpk1`→`xpk2`, `xsj2`→`xsj3`, a documented "re-zero rename"), the loader looks up `creepmeter_calibrated.csv`'s `processed` column (the calibration identity) in `Creep_calib_140224.dat`, but always stores `channel` = the manifest's `sensor` column (the raw identity) — so `creep.calibrations.channel` always matches `creep.observations.channel`.
-
-## Known data-quality gotchas (read before trusting a "current" channel)
-
-Found while building `channel_map` and cross-checking against `README_CreepmeterChannels.txt` and raw file headers. All are real, verified against source files, not assumptions:
-
-| site/channel | issue | resolution |
-|---|---|---|
-| `cpp` (`cpp1`/`cpp3`) | `cpp.chan`'s latest interval (2024-06-28+) points at `cpp3`, but `cpp.id`'s `Strain=` still says `cpp1` — production (`cpp_merge.bot`) is still built from `cpp1`. The `cpp3`/`calibration_method=CREEP` calibration row exists because the manifest was built from `.chan`'s last interval without cross-checking `.id` — it's a prepared-but-not-activated cutover, not currently live. | `channel_map`: `cpp → cpp1` |
-| `cfwHR` / `cfwLR` | Same bug, inverted: `.id` files say `chan=cfw2`/`chan=cfw3`, but the two sensors were physically swapped between directories in 2020 and the `.id` files were never updated. | resolved to the physically-verified (current) values |
-| `sfr` (`sfrd`/`sf2d`) | **Fixed.** `sfrd` (primary since 2022) died 2025-10-30; `sfr.off`'s own entry for that date says "Use sf2 site," but the machine-readable fields (`.chan` sensor column, `.id` `Strain=`) were never updated — production is likely still pointed at the stale name. `channel_map` now carries **two time-bounded rows** for `dir_stem=sfr` (`effective_start`/`effective_end`, same convention as `calibrations`): `sfrd` through 2025-10-30T22:00, `sf2d` from then on. `load_edits.py` picks the row whose range covers each edit's `event_start`, so the 4 pre-cutover `creep.edits` rows resolve to `sfrd` and the 3 at/after the cutover (including the "Use sf2 site" marker itself) resolve to `sf2d` — previously all 7 were mis-tagged `sfrd`. | `channel_map`/`creep.edits` reloaded in AWS with the split; verified 4×`sfrd`/3×`sf2d`. Note `sf2b`/`sf2o` are a separate physical location (`sf2_dir`, ~100m north per `README_CreepmeterChannels.txt`) with no `.off`/`.edit` file — correctly absent from `channel_map`, not part of this fix. |
-| `xhr` (`xhr2`/`xhr3`), `xmr` (`xmr1`/`xmr2`) | Not ambiguous — sensor-rename lineages, each pair non-overlapping in time except `xmr` (~7mo overlap, documented instrument swap in `xmrFix/README`). `xmr2`'s early history is a manually-stitched composite of multiple loggers (2018-2019) plus a manually-patched ~1yr telemetry gap (2023-2024) — raw data provenance our schema doesn't currently track. | resolved to the current sensor (`xhr3`, `xmr2`) |
-| `xsjv` (site `sjb`) | Two different physical instruments (old dsat logger vs new HOBO logger) share a 4-char code, confirmed **non-overlapping** in time (2007-2021 vs 2024-2026) — not a live collision, just a reused short code across a generational boundary. | `source` column distinguishes them |
-| Rupture pipeline (`cfw2/3, chp2/3, coz2/3, cpp2/3, ctm2/3`) | `monitorR+` historically double-counted the `cos(30°)` orientation correction (already baked into `.chan` values, then divided again at runtime) — now fixed. | load only the corrected post-fix scale; don't model the historical interval. If a raw-vs-processed validation later shows these channels off by ~15.5% (`1/cos(30°)`), this is why. |
-| `xmr` cos(30°) | The new sensor's calibration derivation (`xmrFix/README`) also divides by `cos(30°)` — **not yet verified** whether this is applied correctly once or double-counted like Rupture was. | open question, check before trusting `xmr`'s `scale_value` |
-| `README_CreepmeterChannels.txt` | 3 typos found during cross-check (`chp`→`chp1`, `nrd_dir`→`nfd_dir`, `xsjb`→`xsjd`, all single-letter transpositions) — errors in that doc, not in our tables. | no action needed on our side |
-| `cfwHR.edit` line for 2019-04-05 | Source file has `2019j0951960` — hour 19, **minute 60**, invalid. Blocked the edits loader. | Normalized to `20:00:00` (minute-60 = next-hour rollover, arithmetic not a guess) directly in `docs/creep_edits.csv`. |
-
-Full history and reasoning for all of the above is in the `creepmeter-etl-iceberg-build` and `creepmeter-calibration-pipelines` memory files.
-
-## Cleanstrain integration (needed for the `edited_value` stage) — RESOLVED
-
-`corrected_value` (calibration only) is not expected to match a channel's real processed products once instrumental offsets (wire-wraps, resets — `creep.edits` `kind=offset` rows) fall inside the compared window; those require actually running `cleanstrain`, not just applying `creep.calibrations`. **This is now fully working**: `cleanstrain+ -m 3 -R <prior_results>` reproduces a real production `_cl` file (calibration + instrumental offset/edit removal) to **100% of samples within 0.01mm** (max residual 0.002mm, pure rounding), after removing one expected constant (the reference-datum difference from cold-starting without decades of chained `-R` history — not a bug). Getting here took five real, distinct bug fixes, four of them in the actual toolchain (not test-specific), documented in full below and in `creepmeter-etl-iceberg-build` memory.
-
-- Containerized `cleanstrain+` already exists (`cleanstrain:dev`/`:latest` images, source at `/Users/mikegottlieb/GIT/cleanstrain`, v1.14 vintage 2009). Smoke-tested against the tool's own `EXAMPLE` dataset — output matches the author's shipped reference values almost exactly. The container's numeric engine (`est_noise6ac` etc.) is trustworthy; its GMT4-compat plotting shims are broken but that only affects `.ai` plot files, not data.
-- Only `-f jl` (plain-text year/day-of-year/value/flag format) is usable — the container has no real `xqp`/`catbot`/`atob`, so `.bot` input isn't supported, only a stub that gate-checks ASCII-vs-binary.
-- `.off`/`.edit` file format fed to cleanstrain is byte-identical to what `creep.edits` already models (`flag date [end] [notes]`) — the real files under `home/strain/MONITOR/CREEP/*_dir/*.off`/`.edit` can be used directly.
-- Ran a cold (`-m 2`, no prior history) test on `xmr2` against the real `xmr2_cl_MON.jl`: after removing a constant ~23mm reference-datum offset (expected — the real pipeline chains chunks with `-R <prior_results>` for absolute continuity across years; our isolated window has nothing to anchor to), 92% of samples matched within 1mm. The remaining residual traced to one specific wire-wrap event (2025-11-24) where our isolated estimate diverged from the real pipeline's ~11.6mm offset (published in `xmr2_MON_results`).
-- **`-m 3 -R` debugging — five real bugs found and fixed, all resolved.** Original container ran cleanstrain v1.14 (2009) with several Progs files self-contained (embedding their own copies of shared date routines). Debugging `-m 3 -R xmr2_MON_results` (which initially produced degenerate `inf`-days stats) found, in order:
-  1. `plamp1` (power-law noise amplitude rescaled to the current sampling rate) was never derived when reading a `-R` prior-results file — only `plamp` was. Patched (`plamp1=$plamp`); later found the script's own mode-3-specific recompute block handles this correctly anyway once the real blockers below are fixed, so this patch turned out to be unnecessary but harmless.
-  2. `off_rate_exp_gps_2.f`'s embedded `jul2day` had a hardcoded leap-year lookup table hand-enumerated only through 2016, with a hard `stop` for any year ≥ 2020 ("exceeds limits..recompile!"). **Confirmed this is a divergent/stale copy bundled with this specific repo, not what's deployed** — the real `off_rate_exp_gps_2.f` doesn't embed `jul2day` at all; it links a separate `time.f`, which the real deployment extended through 2040 back in Jan 2017.
-  3. Container's default `awk` was `mawk`, which doesn't support the `**` operator this script relies on throughout (`awk: syntax error at or near *` — the exact error seen everywhere). `-m 2`'s core processing (compiled Fortran) wasn't affected, but `-m 3`'s offset-window calculation (shell+awk) was completely broken by it. Fixed: install `gawk`, set as the `awk` alternative.
-  4. `bigrate` (background rate to remove, read from a `"The rate is"` line) comes back empty when reading a creep-style results file, because creep results deliberately never model a rate (rate *is* the creep signal, not a trend to strip — `-t 0` disables tides for the same reason). **Confirmed this is a real latent bug in the actual current production script too** (`cleanstrain1.16+`), not just this repo's copy. Patched with a `bigrate=0` default in both places.
-  5. `date2jul.f`/`jul2daynum.f`/`daynum2jul.f`/`jul2date.f` had the *same* divergent-embedded-copy problem as `off_rate_exp_gps_2.f` (bug 2) — but worse: `daynum2jul`'s embedded `inv_jul_time` had **no bounds check at all** past its hardcoded 60-year (1960-2020) table, so for 2025+ dates it silently read out-of-bounds array memory and returned garbage day-numbers in the hundreds of millions, instead of crashing. This fed a malformed time-window into `est_noise8`'s input (`est3.in`), which silently read zero observations. Fixed the same way as bug 2: swapped in the real files (all confirmed byte-identical to the official 2016 public release or the live deployment) and linked them against `time.f` instead of patching the embedded copies.
-  6. Separately, `time` (the `/usr/bin/time` utility, not the awk/Fortran date logic) wasn't installed — the script's `#!/bin/sh` shebang is dash on Ubuntu, which has no `time` builtin, so every `time est_noise8 ...`-prefixed call silently failed as "command not found" and **`est_noise8` never ran at all**, regardless of how correct its input was. `est_noise8` itself was confirmed fully correct by invoking it manually. Fixed: installed the `time` package.
-  - Along the way, discovered the real deployed pipeline runs `est_noise8` (an internal, unreleased successor with no public source) rather than the publicly-distributed `est_noise6.50`/`est_noise6ac`. Rebuilt `cleanstrain:dev` as a multi-stage image: `est_noise8` compiled from source in a separate image (`/Users/mikegottlieb/GIT/est_noise`, native arch, no emulation needed) and copied in; main script swapped to the real `cleanstrain1.16+`.
-  - **Result**: all four published offsets in `xmr2_MON_results` now reproduce almost exactly (two bit-for-bit identical: `11.5792`, `-0.0344`; the other two within 0.002mm: `-11.5081` vs `-11.5069`, `-11.5859` vs `-11.5856`). The final `_cl` output matches the real `xmr2_cl_MON.jl` at **100% of samples within 0.01mm** (max residual 0.002mm, pure rounding) after removing one expected constant (reference-datum difference from cold-starting without decades of `-R` chaining — not a bug).
-  - Not fixed, not on the current call path: no other Progs files were found with the same divergent-embedded-copy pattern, but this wasn't exhaustively audited beyond the files actually exercised by this test.
-  - `date2jul.f`, `jul2daynum.f`, `daynum2jul.f`, `jul2date.f` in this repo also embed their own inline `jul2day`/`date2day` copies (same pattern as the old broken `off_rate_exp_gps_2.f`) — not on the current call path, not fixed, flagged as latent risk if anything routes 2020+ dates through them later.
-- **Done, and it confirms our understanding is correct**: applied `xmr2_MON_results`'s four published offset magnitudes as manual step corrections (cumulative sum of offsets at/before each sample's timestamp, subtracted once per sample) on top of `raw*scale` in Python, bypassing `-R` entirely. First attempt had a bug (accumulating `-=` inside a loop over *nested*, not disjoint, time masks double/triple-counted later segments); fixed by building the per-sample cumulative correction via sequential overwrite, then subtracting once. Result: **99.9996% of samples match the real `xmr2_cl_MON.jl` within 0.01mm**, after removing one remaining constant (-11.57mm — the same expected reference-datum difference as before, not an error). This confirms the calibration+offset combination logic is exactly right; what's still missing is getting `cleanstrain` itself to reliably *estimate* offset magnitudes from scratch (the `-R` chaining problem above), not our understanding of how to apply them once known.
-
-## `creep.observations`: raw_value is float32, and storage is sparse
-
-Two design decisions made after the first real load attempt surfaced concrete problems (full story below):
-
-- **`raw_value` is `float` (32-bit), not `double`.** No source in this archive exceeds float32 precision -- every channel is either FLOAT4-native or INT2 counts, both exact in float32. Halves the column's storage for no loss of fidelity. `corrected_value`/`edited_value` stay `double` since calibration arithmetic (scale multiply, offset add, cumulative-correction subtraction) can accumulate error that float32 wouldn't absorb as cleanly.
-- **Storage is sparse: rows equal to the source bottle's own missing-data sentinel (`32767` INT2 / `999999` INT4,FLOAT4) are dropped at load time, not stored.** Deliberately no `raw_missing` flag column and no separate header-metadata table. Reasoning: the raw bottle files under `home/lrgs/` already *are* that metadata -- they define the exact `(start, interval, num_pts)` grid a full reconstruction would need -- so a validation step that ever needs the original row count/grid back can just re-read the same bottle file directly, rather than this archive needing to carry a parallel copy of that information forever. Tradeoff accepted deliberately: `creep.observations` is therefore not a fully self-contained byte-for-byte mirror on its own -- it depends on the original bottle files remaining retained. Bonus: every stored row is real data by construction, so `raw_value*scale+offset` is valid unconditionally; no downstream consumer needs to special-case the sentinel (unlike reading a raw bottle file directly, which still can hit it). `etl/apply_calibration.py`'s `missing` parameter reflects this -- it's optional now (`None` default), needed only for ad hoc validation against a raw bottle file, not for anything read back from Iceberg.
-
-Implemented in `etl/load_observations.py`'s `file_to_arrow()`, which now returns `(arrow_table, n_dropped_missing)` and logs the dropped count per file.
-
-**Decode optimization (applied before the real load, verified byte-identical):** `bottle.py`'s `read_values()` decoded samples via `struct.unpack()` into a Python tuple/list before `np.asarray()` could vectorize it -- boxing every sample as its own Python object dominated decode time on multi-million-point files (35x slower than the alternative on a 3.9M-point file in a direct A/B comparison, same values bit-for-bit). Switched to `np.frombuffer()` directly on the raw bytes with an explicit endian-tagged dtype (`i2`/`i4`/`f4`), skipping the Python-object boxing step entirely. Confirmed in the real load: build time was 0.0-0.2s per file even for the largest files (`cfw1`/`chp1`/`ctm1` at ~65-68MB raw), with S3 upload (4-27s per file) the dominant cost throughout -- decode was never the bottleneck once this landed.
-
-## The observations load: small-files problem, and the first real load attempt
-
-The first real (non-local-test) load run crashed after 26 files with an `S3 RequestTimeTooSkewed` / surfaced-as-`ACCESS_DENIED` error on a `HeadObject` call. Diagnosed as transient clock skew (not a persistent config or SSO-expiry issue -- ruled out by confirming `aws sts get-caller-identity` still succeeded, and the system clock re-synced via NTP shortly after). Verified via a cheap Iceberg snapshot/manifest-entry introspection (not a full table scan) that exactly 26 files had safely committed before the crash, row counts matching the run log exactly.
-
-Before resuming, a direct question ("how does the size in s3 of a single loaded file compare to the bottle file size?") surfaced a real problem: the original schema partitioned by `days(timestamp)`, which is far too fine for low-frequency, decades-long single-site channels. `c461` (10-min interval, ~15 years) produced **5,569 Parquet files** (~144 rows each) totaling 26.25MB in S3 for a 1.60MB raw bottle file -- **16.4x size bloat**, almost entirely per-file Parquet footer/schema/stats overhead, not real data. `chp1` similarly produced 11,665 files (1.87x bloat). Fixed by evolving the live table's partition spec from `days(timestamp)` to `years(timestamp)` (`table.update_spec()`: removed the day field, added a year field) -- old committed data is untouched by a spec change, only new writes use the new spec. Verified with a clean single-file test load (`chpt`): 33 files (one per year) instead of thousands, 2.05x size ratio instead of 16.4x.
-
-Immediately after (before any further load), the float32 + sparse-storage decision above was made and implemented, which required dropping and recreating `creep.observations` with the new schema/partition spec -- **this destroyed all 27 previously-loaded files (26 real + the `chpt` test)**. The table was recreated empty, then the load was explicitly paused pending go-ahead.
-
-**Full from-scratch load completed successfully.** All 134 unique raw bottle files loaded with zero errors in 17.4 minutes: **173,214,722 total rows**, 1,933 data files, 1.19GB in S3, verified 134 distinct `(site, channel, source)` combinations with no gaps or duplicates. The `read_values()` decode optimization below (np.frombuffer instead of struct.unpack) was applied first and held up under the real run -- build time was negligible (0.0-0.2s per file) versus S3 upload time (4-27s per file) dominating wall-clock throughout.
-
-## Two legacy-complexity cleanups (no observations load involved)
-
-Done separately from the observations work above, on live `calibrations`/`edits` data:
-
-1. **`creep.calibrations.pipeline` renamed to `calibration_method`** via an in-place Iceberg schema evolution (`update_schema().rename_column(...)`, plus `update_column(doc=...)` on the fields whose doc text referenced the old name) -- no reload needed, all 156 existing rows preserved. Removes the long-standing ambiguity where `calibrations.pipeline` and `edits.pipeline` shared a name but meant different things (calibration recipe vs. directory tree).
-2. **`creep.edits` now resolves `site`/`channel`/`source` at load time instead of requiring a `creep.channel_map` join downstream.** `docs/creep_edits.csv`'s old `channel` column (a directory stem, not a raw sensor id) was renamed to `dir_stem`; `etl/load_edits.py` now looks up `dir_stem` in `docs/creep_channel_map.csv` and stores the resolved `site`/`channel`/`source` directly. This also fixed a real bug: the CSV's old `site` value was a naive copy of the directory stem, wrong for 15 of 53 directories (e.g. `dir_stem=xsjd` was stored as `site=xsj`; the true site is `sjb`). Required dropping and reloading `creep.edits` (schema changed, not just a rename) -- reloaded and verified, still 1481 rows, no nulls in the resolved columns. `creep.channel_map` is unchanged in content and stays live, now serving as an audit trail of *how* each directory was resolved rather than something queried at read time.
-3. **`creep.channel_map` extended to support time-bounded resolution per `dir_stem`** (`effective_start`/`effective_end`, nullable, same convention as `calibrations`), to fix the `sfr` gotcha above -- a single `dir_stem` can now resolve to different channels depending on when the edit happened, not just a single flat lookup. `etl/load_edits.py` picks the `channel_map` row whose range covers each edit's `event_start`, raising if zero or more than one row matches. Both `creep.channel_map` (54 rows) and `creep.edits` (1481 rows) were dropped and reloaded with this change.
-
-## `corrected_value` backfill and validation (in progress, channel by channel)
-
-Now that `creep.observations` is loaded (see above), backfilling `corrected_value`/`corrected_units` per channel via `etl/backfill_corrected.py` -- full history, since calibration is a deterministic lookup+multiply (no estimation), unlike `edited_value`/`qc_status` which need real offset-estimation and are deferred to a later pass.
-
-**Real bug found and fixed in `apply_calibration.py` before backfilling at scale**: `row["effective_start"].timestamp()` on a naive (no-tzinfo) datetime is interpreted by Python as *local* time, not UTC, silently shifting every calibration interval boundary by the host's UTC offset. Confirmed real impact, not theoretical: 961 samples in `xmr2` alone got exactly 2x the correct scale (assigned to the wrong side of a 2019 recalibration boundary) under the buggy code. Fixed via an explicit `.replace(tzinfo=datetime.timezone.utc)` before calling `.timestamp()`.
-
-**Validation ground truth discovered: `<sensor>.jl`** (e.g. `home/strain/MONITOR/CREEP/xsh_dir/xshh.jl`) is the real, full-history, pre-cleanstrain calibrated bottle in plain text -- for CREEP-ID and CREEP(Bilham/HOBO) pipelines, which scale at fetch time. It is **not** available for CREEP-USGS-pipeline channels (they fetch raw with a "no scaling" flag; `Apply_Cal_1+`'s calibrated `.sc` output isn't persisted in this snapshot) -- for those, `<sensor>_cl_MON.jl` (post-cleanstrain, requires modeling offsets too) is the only ground truth available. `_pr`/`_pr_td`/etc. suffixes are **not** calibration-only -- confirmed against `cleanstrain.txt` and the driver scripts that they're cleanstrain *outputs* (pressure/tide removed, applied *after* edits), and that tide (`-t 0` everywhere) and pressure (`-p` commented out everywhere) correction are both dead code across the whole CREEP/Rupture pipeline currently.
-
-**Second real bug found via this validation: CREEP-pipeline calibration only had the *current* `.chan` scale, not full history** -- see the fix documented above (`docs/creepmeter_channels.csv` now used instead of the manifest's single-value `scale` column). This alone took full-history-validated channels from 15/50 to 30/50 matching within 0.01mm against `<sensor>.jl`.
-
-**A third correction layer exists: hardcoded per-site "fixit" script patches (`fixitCreep+`/`fixitXMR+`), applied before cleanstrain runs, for 9 sites: `xmr2, xsc1, xmm1, xta1, ctm1, cpp1, xhr3, xmd1, c461`.** Now modeled directly in `creep.edits`, not a separate Python-only data structure: three new columns, `edit_source` (`off_edit_file` | `fixit_script`), `apply_stage` (`calibrated_mm` | `raw_counts` -- whether the magnitude applies before or after calibration), and `magnitude` (only ever populated for `fixit_script` rows -- `off_edit_file` rows leave it null since production estimates the real offset size via cleanstrain, not a hardcoded constant). `etl/fixit_patches.py` holds the seed data (with full provenance notes) and `etl/load_fixit_edits.py` appends it; `backfill_corrected.py` queries `creep.edits` directly (`edit_source='fixit_script' AND applied=true`) rather than importing the module, so the table is the actual runtime source of truth, not just documentation. Verified empirically per site (not assumed from the script text), since not every branch is actually live in the current archived data:
-- **Live and captured**: `xmr2` (`+11.57mm` at 2019-08-26, mm-stage), `ctm1` (`+13.95mm` at 2020-03-01 + `+9.76mm` at 2024-07-16, both mm-stage despite `fixitCreep+`'s "counts" label), `xhr3` (`+31.83mm` at 2022-08-17, mm-stage), `xta1` (`-934 counts` at 2017-03-16, counts-stage -- matches its calibration scale exactly: `-934 * 0.007092 = -6.624mm` -- + `+28.9mm` at 2021-06-18, mm-stage), `xmm1` (`+30.02mm` at 2021-06-18 + `+20.9mm` at 2024-11-07, both mm-stage). All confirmed 99.9999-100% full-history match against `<sensor>.jl` after applying.
-- **Not live** (documented patch, but production never actually applied it -- applying it breaks an otherwise-perfect match): `c461`'s `+67.90mm` (the second `+12.49mm` line is dead code anyway, outside the script's heredoc) and `cpp1`'s `-5.23mm`. Both stored in `creep.edits` with `edit_source='fixit_script', applied=false` -- a deliberate record that these were checked and found not needed, not just an omission. `backfill_corrected.py` only sums `applied=true` rows, so these have no effect on `corrected_value`.
-- `xsc1` (`+40.414789mm` at 2021-06-15 23:20:00) and `xmd1` (`+12.13mm` at 2024-11-05 23:20:00), both mm-stage: **live and captured**, both 99.9999% match. `xsc1`'s real magnitude had to be measured empirically -- the script's own comment (`40.078`, "let out 35.7mm of wire") leaves a clean, constant 0.337mm residual for the rest of history; `40.414789` is what actually reproduces production. All 9 sites with a fixitCreep+/fixitXMR+ branch are now checked.
-
-**Validating `xsc1`/`xmd1` surfaced a general methodology fix, not just their specific patches**: both channels' raw bottle clocks run ~32 seconds off their `.jl` files' quantized timestamps (e.g. raw `22:19:28` vs `.jl`'s `22:20:00`). Exact-minute rounding (`.dt.round('min')`) silently rounds these to *different* minutes for nearly every sample, producing near-zero merge overlap that looks like total failure rather than a 32-second clock skew. Switched to a tolerance-based join (`pd.merge_asof(..., direction='nearest', tolerance=45s)`) for these two; worth using generally for any future channel that inexplicably shows ~0% or 0 merged rows before concluding the calibration itself is wrong.
-
-A related, same-class bug found while chasing this down: **`xfro`'s `.chan` file documents a 2025-02-26 "switch to licor" cutover to `scale=1.000`, but production never actually applied it** -- `xfro.jl`'s real/raw ratio stays at the old `2.334` for its *entire* archived history through 2026-03. Fixed the same way as the `cpp3`-not-yet-active gotcha: `load_calibrations.py` now has a small, explicit `NOT_YET_LIVE_CUTOVER` exception list (checked against a specific documented interval, raises if the `.chan` data changes underneath it) that drops the not-yet-live interval and extends the prior one to open-ended. Only `xfro` needed this -- the other 10 "switch to licor" channels (`xshh, xsjd, cfwhi, cfwho, xfrd, xfrnd, xfrno, meed, meeo, sjnh, xshl`) all validated correctly as-is.
-
-**41 channels now backfilled and independently validated live from the table, all 99.9999-100% except `cpp1`**: `xhr2` (CREEP-USGS, tiny/retired lineage member), `xmr2`, `c461`, `xfro`, `ctm1`, `xhr3`, `xta1`, `xmm1`, `xsc1`, `xmd1`, plus 30 more confirmed correct by the multi-interval calibration fix alone and then backfilled with `etl/backfill_corrected.py`: `x461, cfw1, cfwhi, cfwho, chp1, coz1, crr1, cwn1, cwn2, cwn3, cwn4, meed, meeo, meet, xsjd, sjnh, wkr1, xfrd, xfrnd, xfrno, xgh1, xmr1, xmrc, xmro, xmrt, xshco, xshh, xshl, xshrh, xsht, xva1`. `cpp1` is 95.09% -- known, accepted ~5-month 2020 resolution-transition-boundary blip; `cpp1.jl` itself also simply stops in June 2024 when `cpp3` took over, unrelated to us. **The other ~93 loaded channels have not had `backfill_corrected.py` run yet** -- `corrected_value` is still null for them regardless of whether their calibration would validate correctly.
-
-`crr1`/`wkr1`/`xgh1` turned out to be more of the same clock-offset artifact discovered on `xsc1`/`xmd1` (near-zero merge under exact-minute rounding, 99.9999-100% under a tolerance-based join) -- not a real problem, just a diagnostic-methodology gap. Fixed by switching the validation script to `pd.merge_asof(direction='nearest', tolerance=45s)`.
-
-**Temperature-companion channels (`c46t, cfwt, chpt, cozt, cppt, ctmt`) investigated and deliberately left uncalibrated.** All 6 showed 0% match; root cause confirmed (not a validation-methodology issue like the clock-offset cases above): each `<sensor>t.jl`'s real/raw ratio tracks its **site's primary strain channel's calibration scale exactly**, including through the primary's own recalibration boundaries (e.g. `cfwt`'s ratio is `cfw1`'s `-0.0117`/`-0.001170` two-interval history, `chpt` tracks `chp1`, etc.) -- this is `get_creep_usgs+`'s idname-truncation bug (previously documented for `c46t` only) turning out to affect all 6 sites identically, not a real temperature conversion at all. **Confirmed the resulting "temperatures" are physically impossible**: `c46t` ranges -376C to +372C, `chpt` -332C to +47C, `cozt` -198C to +336C, `ctmt` -212C to +289C (only `cfwt`/`cppt` stay in a superficially plausible range by chance). Explicit decision (user call): do **not** replicate this bug by cloning the primary channel's calibration onto the temp channel -- `corrected_value` should represent genuine measurements, not a legacy pipeline artifact that happens to match production's own wrong output. These 6 stay `calibration_method=NULL` like any other uncalibrated DSAT row; documented in `load_calibrations.py`'s `TEMP_CHANNEL_NOT_CALIBRATED` set (a deliberate no-op marker, not a behavior change) so the finding isn't lost. This looks like a live, unfixed bug in the legacy production pipeline itself, worth flagging to whoever maintains it.
-
-**Still open**: `xpk1`/`xsj2` (CREEP-USGS, near-0% even under the tolerant join -- not the clock-offset artifact, cause still unknown, possibly the documented `xpk1`→`xpk2`/`xsj2`→`xsj3` re-zero-rename calibration-label mismatch). The ~93 channels with no `.jl` ground truth at all remain unvalidated by this method entirely.
-
-## Status
-
-- AWS infra live: S3 bucket + Glue database created under `dev` profile.
-- Local venv at `etl/.venv` (pyiceberg, boto3, pandas) set up.
-- All four schemas finalized, persisted to `docs/*.iceberg.sql`, and mirrored in `etl/catalog.py` (pyiceberg has no SQL DDL executor, so table creation goes through its Python API -- the two must be kept in sync by hand).
-- All four tables live in the Glue catalog, schemas verified to match the `.iceberg.sql` files exactly. `creep.observations` partitioned by `(years(timestamp), site)` (evolved from an initial `days(timestamp)` after a small-files problem, see above) with `raw_value` as `float` (32-bit) and sparse missing-value storage (see above). Currently **empty** (dropped/recreated for the schema change) -- `creep.calibrations`, `creep.edits`, `creep.channel_map` are loaded (see next bullet) and untouched by this.
-- `etl/bottle.py`: vendored/trimmed bottle-file reader, verified against `cpp1`'s header and values.
-- `creep.channel_map`'s data fully built and cross-verified (`docs/creep_channel_map.csv`).
-- `etl/load_channel_map.py`, `etl/load_edits.py`, and `etl/load_calibrations.py` written, run, and verified: `creep.channel_map` (53 rows), `creep.edits` (1481 rows, `site`/`channel`/`source` resolved at load time -- see legacy-complexity cleanups above), `creep.calibrations` (156 rows from 135 manifest rows -- 20 CREEP-USGS + 1 CREEP-ID manifest rows expand to 41+1 rows via `Creep_calib_140224.dat`'s multiple intervals per channel; no `calibration_id` collisions; `pipeline` column renamed to `calibration_method`).
-- `etl/creep_calib_dat.py`: standalone parser for `Creep_calib_140224.dat`'s inconsistent-column-count format, verified against every line in the file.
-- `etl/raw_units.py`: derives per-channel `raw_units` from the manifest (not a uniform `'counts'` default -- rule-based on `conf_reason`/`pipeline`/`scale`, e.g. `V` for volt-native `.chan` channels, `mm` for HOBO channels whose firmware already outputs displacement, `unknown` where the manifest itself flags the encoding as unverified). Validated against all 135 rows.
-- `etl/load_observations.py`: writes float32 `raw_value`, sparse (missing-sentinel rows dropped), year-partitioned. A first real load attempt reached 26/134 files before a transient clock-skew crash (recovered via resume), then a small-files partitioning fix and the float32/sparse schema change both required recreating the table from empty -- see above. **The from-scratch reload is now complete**: all 134 files, 173,214,722 rows, zero errors, 17.4 minutes wall-clock.
-- AWS `dev` SSO sessions are short-lived and expire mid-session repeatedly -- expect to need `aws sso login --profile dev` refreshed more than once while running loaders.
+AWS SSO note: `dev` profile sessions are short-lived and expire mid-session often — `aws sso login --profile dev` to refresh.
